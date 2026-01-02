@@ -122,10 +122,19 @@ def generate_face_wireframe(
     curves: Dict[str, List[Tuple[float, float, float]]] = {}
 
     # Define canonical vertical positions relative to face height
+    # Vertical anchor points.  The eye position is a fixed proportion of the face
+    # height.  The nose base is offset below the eye position by the
+    # user‑specified nose height.  The mouth and chin are positioned further
+    # down relative to the nose base.
     z_eye = 0.2 * face_height
-    z_nose_base = -0.05 * face_height
-    z_mouth = -0.25 * face_height
-    z_chin = -0.5 * face_height
+    # nose_height defines the vertical distance between the eye level and the
+    # base of the nose.  A larger value elongates the nose downward.  We
+    # clamp the nose_height to sensible proportions relative to face height.
+    max_nose_h = 0.5 * face_height
+    nh = min(nose_height, max_nose_h)
+    z_nose_base = z_eye - nh
+    z_mouth = z_nose_base - 0.2 * face_height
+    z_chin = z_mouth - 0.25 * face_height
 
     # Depth positions
     nose_tip_y = face_depth  # nose protrudes towards viewer
