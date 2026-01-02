@@ -1,76 +1,76 @@
-"""ComfyUI node definition for the parametric face canvas."""
+"""ComfyUI node definition for the parametric face canvas.
+
+This module defines a custom ComfyUI node that renders a parametric
+3D facial structure to a 2D image.  The face is represented as a
+collection of points and straight line segments (edges) augmented
+with circular outlines for the eyes.  Two distinct topologies are
+supported via a gender selector: one approximating the canonical
+Marquardt "Repose Frontal" mask for male features, and another
+derived from a female variant.  Sliders allow deformation of the
+base topology along semantic axes (eye distance, jaw width, etc.),
+and camera parameters control yaw, pitch, distance and field of
+view.  A single "reset all" toggle restores defaults for the
+selected gender and recentres the view.
+"""
 
 from __future__ import annotations
 
 from typing import Dict, Tuple
 
+import numpy as np
 import torch
 
-from . import face_model
 from . import projection
 from . import renderer
+from .topology import male, female
 
 
 class ParametricFaceCanvas:
-    """
-    A custom ComfyUI node that generates a 3D wireframe face and renders it to
-    a 2D image.
+    """Custom node that renders a parametric face to an image.
 
-    The node exposes sliders for facial proportions and camera orientation.
+    The node exposes a set of sliders that deform an underlying
+    facial topology defined by a fixed set of 3D points and edges.
+    Adjusting the sliders scales or translates specific groups of
+    points to change apparent proportions.  A camera model with yaw
+    and pitch rotations and perspective projection is applied, and
+    the resulting 2D points are drawn as straight lines with round
+    eyes on a white canvas.  The gender selector chooses which
+    topology and default parameter set to load.
     """
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, object]]:
-        """Define the node inputs for ComfyUI.
+        """Describe the inputs for ComfyUI.
 
-        In addition to the facial proportions and camera parameters, this
-        definition introduces a ``gender`` selector (male/female), a handful
-        of reset buttons, and symmetry toggles for certain measurements.
-        Reset buttons allow the user to restore defaults for individual
-        parameters or all parameters at once.  Symmetry toggles control
-        whether a distance parameter is interpreted as a full span
-        (symmetrical) or as a half‑distance from the midline (asymmetrical).
+        Inputs are grouped into a single `required` section for the
+        sliders and a minimal `optional` section containing only the
+        `reset_all` button.  Width and height control the canvas
+        resolution; they do not scale the facial geometry.
         """
         return {
             "required": {
-                # Gender selector (drop‑down)
                 "gender": (["male", "female"],),
-                "eye_distance": ("FLOAT", {"default": 0.4, "min": 0.1, "max": 1.0, "step": 0.01}),
-                "eye_size": ("FLOAT", {"default": 0.08, "min": 0.02, "max": 0.3, "step": 0.01}),
-                "nose_width": ("FLOAT", {"default": 0.1, "min": 0.05, "max": 0.3, "step": 0.01}),
-                "nose_height": ("FLOAT", {"default": 0.3, "min": 0.1, "max": 0.6, "step": 0.01}),
-                "jaw_width": ("FLOAT", {"default": 0.8, "min": 0.4, "max": 1.5, "step": 0.01}),
-                "face_height": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 2.0, "step": 0.05}),
-                "face_depth": ("FLOAT", {"default": 0.3, "min": 0.1, "max": 1.0, "step": 0.05}),
-                "yaw": ("FLOAT", {"default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5}),
-                "pitch": ("FLOAT", {"default": 0.0, "min": -45.0, "max": 45.0, "step": 0.5}),
-                "camera_distance": ("FLOAT", {"default": 2.5, "min": 1.0, "max": 5.0, "step": 0.1}),
-                "fov": ("FLOAT", {"default": 1.0, "min": 0.5, "max": 3.0, "step": 0.1}),
-                "image_width": ("INT", {"default": 512, "min": 64, "max": 2048}),
-                "image_height": ("INT", {"default": 512, "min": 64, "max": 2048}),
-                "line_thickness": ("INT", {"default": 2, "min": 1, "max": 10}),
+                # Facial proportion controls
+                "eye_distance": ("FLOAT", {"default": 0.30, "min": 0.10, "max": 1.00, "step": 0.01}),
+                "eye_size": ("FLOAT", {"default": 0.12, "min": 0.02, "max": 0.30, "step": 0.01}),
+                "nose_width": ("FLOAT", {"default": 0.10, "min": 0.02, "max": 0.40, "step": 0.01}),
+                "nose_height": ("FLOAT", {"default": 0.30, "min": 0.05, "max": 0.80, "step": 0.01}),
+                "jaw_width": ("FLOAT", {"default": 0.80, "min": 0.30, "max": 1.80, "step": 0.01}),
+                "face_height": ("FLOAT", {"default": 1.00, "min": 0.50, "max": 2.00, "step": 0.01}),
+                "face_depth": ("FLOAT", {"default": 0.30, "min": 0.00, "max": 1.50, "step": 0.01}),
+                # Camera controls
+                "yaw": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.5}),
+                "pitch": ("FLOAT", {"default": 0.0, "min": -60.0, "max": 60.0, "step": 0.5}),
+                "camera_distance": ("FLOAT", {"default": 2.5, "min": 0.5, "max": 10.0, "step": 0.1}),
+                "fov": ("FLOAT", {"default": 1.0, "min": 0.2, "max": 5.0, "step": 0.1}),
+                # Output canvas size and line thickness
+                "image_width": ("INT", {"default": 1024, "min": 64, "max": 4096}),
+                "image_height": ("INT", {"default": 1024, "min": 64, "max": 4096}),
+                "line_thickness": ("INT", {"default": 4, "min": 1, "max": 20}),
             },
             "optional": {
-                # Global reset button – restore all parameters to defaults for the selected gender
+                # Single toggle to restore defaults for the chosen gender
                 "reset_all": ("BOOLEAN", {"default": False}),
-                # Individual reset buttons – restore a single parameter to its default
-                "reset_eye_distance": ("BOOLEAN", {"default": False}),
-                "reset_eye_size": ("BOOLEAN", {"default": False}),
-                "reset_nose_width": ("BOOLEAN", {"default": False}),
-                "reset_nose_height": ("BOOLEAN", {"default": False}),
-                "reset_jaw_width": ("BOOLEAN", {"default": False}),
-                "reset_face_height": ("BOOLEAN", {"default": False}),
-                "reset_face_depth": ("BOOLEAN", {"default": False}),
-                "reset_yaw": ("BOOLEAN", {"default": False}),
-                "reset_pitch": ("BOOLEAN", {"default": False}),
-                "reset_camera_distance": ("BOOLEAN", {"default": False}),
-                "reset_fov": ("BOOLEAN", {"default": False}),
-                "reset_image_size": ("BOOLEAN", {"default": False}),
-                "reset_line_thickness": ("BOOLEAN", {"default": False}),
-                # Symmetry toggles – interpret values as full distances (True) or half distances (False)
-                "eye_distance_sym": ("BOOLEAN", {"default": True}),
-                "nose_width_sym": ("BOOLEAN", {"default": True}),
-                "jaw_width_sym": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -79,39 +79,33 @@ class ParametricFaceCanvas:
     CATEGORY = "CS Custom Nodes/Face"
     FUNCTION = "execute"
 
-    # Default facial and camera parameters for male and female presets.
-    MALE_DEFAULTS: Dict[str, object] = {
-        "eye_distance": 0.4,
-        "eye_size": 0.08,
-        "nose_width": 0.12,
-        "nose_height": 0.35,
-        "jaw_width": 0.9,
-        "face_height": 1.0,
-        "face_depth": 0.35,
+    # Preset parameter values for each gender.
+    MALE_DEFAULTS: Dict[str, float] = {
+        "eye_distance": 0.30,
+        "eye_size": 0.12,
+        "nose_width": 0.10,
+        "nose_height": 0.30,
+        "jaw_width": 0.80,
+        "face_height": 1.00,
+        "face_depth": 0.30,
         "yaw": 0.0,
         "pitch": 0.0,
         "camera_distance": 2.5,
         "fov": 1.0,
-        "image_width": 512,
-        "image_height": 512,
-        "line_thickness": 2,
     }
 
-    FEMALE_DEFAULTS: Dict[str, object] = {
-        "eye_distance": 0.36,
-        "eye_size": 0.1,
+    FEMALE_DEFAULTS: Dict[str, float] = {
+        "eye_distance": 0.28,
+        "eye_size": 0.13,
         "nose_width": 0.09,
-        "nose_height": 0.32,
+        "nose_height": 0.28,
         "jaw_width": 0.75,
-        "face_height": 1.0,
-        "face_depth": 0.3,
+        "face_height": 1.00,
+        "face_depth": 0.25,
         "yaw": 0.0,
         "pitch": 0.0,
         "camera_distance": 2.5,
         "fov": 1.0,
-        "image_width": 512,
-        "image_height": 512,
-        "line_thickness": 2,
     }
 
     def execute(
@@ -132,100 +126,110 @@ class ParametricFaceCanvas:
         image_height: int,
         line_thickness: int,
         reset_all: bool = False,
-        reset_eye_distance: bool = False,
-        reset_eye_size: bool = False,
-        reset_nose_width: bool = False,
-        reset_nose_height: bool = False,
-        reset_jaw_width: bool = False,
-        reset_face_height: bool = False,
-        reset_face_depth: bool = False,
-        reset_yaw: bool = False,
-        reset_pitch: bool = False,
-        reset_camera_distance: bool = False,
-        reset_fov: bool = False,
-        reset_image_size: bool = False,
-        reset_line_thickness: bool = False,
-        eye_distance_sym: bool = True,
-        nose_width_sym: bool = True,
-        jaw_width_sym: bool = True,
     ) -> Tuple[torch.Tensor]:
-        """Generate the face wireframe image with optional resets and symmetry toggles."""
-        # Select defaults based on gender
+        """Generate and return the rendered face image.
+
+        This method performs the following high level steps:
+
+        1. Load the appropriate base topology (male or female).
+        2. If `reset_all` is toggled, apply the default parameters for
+           the selected gender.
+        3. Copy the base points so that deformations do not affect the
+           originals.
+        4. Apply semantic deformations (eye distance, jaw width, etc.).
+        5. Rotate and project the 3D points to 2D using the camera
+           parameters.
+        6. Render the resulting graph using straight lines for edges
+           and circles for eyes.
+        7. Convert the PIL image to a ComfyUI‑compatible BHWC tensor.
+        """
+        # Select topology and default parameters by gender
+        topo = male if gender == "male" else female
         defaults = self.MALE_DEFAULTS if gender == "male" else self.FEMALE_DEFAULTS
-        # Assemble current parameters into a dictionary
-        params: Dict[str, object] = {
-            "eye_distance": eye_distance,
-            "eye_size": eye_size,
-            "nose_width": nose_width,
-            "nose_height": nose_height,
-            "jaw_width": jaw_width,
-            "face_height": face_height,
-            "face_depth": face_depth,
-            "yaw": yaw,
-            "pitch": pitch,
-            "camera_distance": camera_distance,
-            "fov": fov,
-            "image_width": image_width,
-            "image_height": image_height,
-            "line_thickness": line_thickness,
-        }
-        # Apply global reset
+
+        # Apply reset: override the input parameters with defaults
         if reset_all:
-            params.update(defaults)
-        else:
-            # Handle individual resets
-            individual_flags = {
-                "eye_distance": reset_eye_distance,
-                "eye_size": reset_eye_size,
-                "nose_width": reset_nose_width,
-                "nose_height": reset_nose_height,
-                "jaw_width": reset_jaw_width,
-                "face_height": reset_face_height,
-                "face_depth": reset_face_depth,
-                "yaw": reset_yaw,
-                "pitch": reset_pitch,
-                "camera_distance": reset_camera_distance,
-                "fov": reset_fov,
-                "image_width": reset_image_size,
-                "image_height": reset_image_size,
-                "line_thickness": reset_line_thickness,
+            eye_distance = defaults["eye_distance"]
+            eye_size = defaults["eye_size"]
+            nose_width = defaults["nose_width"]
+            nose_height = defaults["nose_height"]
+            jaw_width = defaults["jaw_width"]
+            face_height = defaults["face_height"]
+            face_depth = defaults["face_depth"]
+            yaw = defaults["yaw"]
+            pitch = defaults["pitch"]
+            camera_distance = defaults["camera_distance"]
+            fov = defaults["fov"]
+
+        # Copy base point positions so modifications are local
+        points = {k: list(v) for k, v in topo.POINTS.items()}
+
+        # ----- Deformation logic -----
+        # Overall face height (z scaling) and depth (y scaling)
+        for k, (x, y, z) in topo.POINTS.items():
+            points[k][2] = z * face_height
+            points[k][1] = y * face_depth
+
+        # Eye distance: adjust centres along x axis (left negative, right positive)
+        if "eye_c_l" in points and "eye_c_r" in points:
+            points["eye_c_l"][0] = -abs(eye_distance)
+            points["eye_c_r"][0] = abs(eye_distance)
+
+        # Nose width: adjust nostril x positions symmetrically
+        for nk in ["nostril_l", "nostril_r"]:
+            if nk in points:
+                points[nk][0] = np.sign(topo.POINTS[nk][0]) * abs(nose_width)
+
+        # Nose height: adjust vertical (z) positions of mid and base relative to nose_top
+        if {"nose_top", "nose_mid", "nose_base"}.issubset(points):
+            top_z = points["nose_top"][2]
+            points["nose_mid"][2] = top_z - (nose_height * 0.6)
+            points["nose_base"][2] = top_z - (nose_height * 1.0)
+
+        # Jaw width: scale x positions of lateral jaw points
+        jaw_keys = [
+            "temple_l", "cheek_l", "jaw_l",
+            "temple_r", "cheek_r", "jaw_r",
+        ]
+        for jk in jaw_keys:
+            if jk in points:
+                base_x = topo.POINTS[jk][0]
+                # The default jaw width in the topology corresponds to 0.80 for male;
+                # scale relative to that baseline
+                scale_factor = jaw_width / 0.80
+                points[jk][0] = np.sign(base_x) * abs(base_x) * scale_factor
+
+        # ----- Projection -----
+        # Convert points to tuples for projection
+        pts3 = {k: tuple(v) for k, v in points.items()}
+        pts2: Dict[str, Tuple[float, float]] = {}
+        for k, p in pts3.items():
+            # Apply rotation then projection
+            rp = projection.rotate_points([p], yaw_deg=yaw, pitch_deg=pitch)[0]
+            pp = projection.project_points([rp], camera_distance=camera_distance, fov=fov)[0]
+            pts2[k] = pp  # (x, z) after perspective
+
+        # Compute eye radii scaling relative to default sizes
+        eye_defs = {}
+        for side in ["left", "right"]:
+            base = topo.EYES[side]
+            # scale radius proportionally to input eye_size (baseline 0.12)
+            scale = eye_size / 0.12
+            eye_defs[side] = {
+                "center_key": base["center_key"],
+                "radius": base["radius"] * scale,
             }
-            for key, flag in individual_flags.items():
-                if flag:
-                    params[key] = defaults[key]
-        # Symmetry toggles: treat distances as half distances when asymmetrical
-        if not eye_distance_sym:
-            params["eye_distance"] = float(params["eye_distance"]) * 2.0
-        if not nose_width_sym:
-            params["nose_width"] = float(params["nose_width"]) * 2.0
-        if not jaw_width_sym:
-            params["jaw_width"] = float(params["jaw_width"]) * 2.0
-        # Generate the face curves
-        curves = face_model.generate_face_wireframe(
-            eye_distance=params["eye_distance"],
-            eye_size=params["eye_size"],
-            nose_width=params["nose_width"],
-            nose_height=params["nose_height"],
-            jaw_width=params["jaw_width"],
-            face_height=params["face_height"],
-            face_depth=params["face_depth"],
+
+        # Render the graph onto a canvas
+        img = renderer.render_graph(
+            points_2d=pts2,
+            edges=topo.EDGES,
+            eyes=eye_defs,
+            image_size=(image_width, image_height),
+            line_thickness=line_thickness,
         )
-        # Rotate and project curves
-        projected = projection.project_curves(
-            curves,
-            yaw_deg=params["yaw"],
-            pitch_deg=params["pitch"],
-            camera_distance=params["camera_distance"],
-            fov=params["fov"],
-        )
-        # Render to image
-        img = renderer.render_wireframe(
-            projected,
-            image_size=(int(params["image_width"]), int(params["image_height"])),
-            line_thickness=int(params["line_thickness"]),
-        )
-        # Convert to BHWC tensor normalised to [0,1]
-        import numpy as np  # local import to avoid unnecessary dependency when unused
-        arr = torch.tensor(np.array(img), dtype=torch.float32) / 255.0
-        tensor = arr.unsqueeze(0)
+
+        # Convert to BHWC tensor for ComfyUI
+        arr = renderer.pil_to_comfy_image(img)
+        tensor = torch.from_numpy(arr)
         return (tensor,)
